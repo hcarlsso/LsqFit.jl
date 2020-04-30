@@ -35,12 +35,14 @@ function levenberg_marquardt(df::OnceDifferentiable, initial_x::AbstractVector{T
     x_tol::Real = 1e-8, g_tol::Real = 1e-12, maxIter::Integer = 1000,
     lambda = T(10), tau=T(Inf), lambda_increase::Real = 10.0, lambda_decrease::Real = 0.1,
     min_step_quality::Real = 1e-3, good_step_quality::Real = 0.75,
-    show_trace::Bool = false, lower::Vector{T} = Array{T}(undef, 0), upper::Vector{T} = Array{T}(undef, 0), avv!::Union{Function,Nothing,Avv} = nothing
+    show_trace::Bool = false,
+    lower::Vector{T} = Array{T}(undef, 0), upper::Vector{T} = Array{T}(undef, 0),
+    avv!::Union{Function,Nothing,Avv} = nothing
     ) where T
 
     # First evaluation
     value_jacobian!!(df, initial_x)
-    
+
     if isfinite(tau)
         lambda = tau*maximum(jacobian(df)'*jacobian(df))
     end
@@ -198,6 +200,149 @@ function levenberg_marquardt(df::OnceDifferentiable, initial_x::AbstractVector{T
         if show_trace
             g_norm = norm(J' * value(df), Inf)
             d = Dict("g(x)" => g_norm, "dx" => delta_x, "lambda" => lambda)
+            os = OptimizationState{LevenbergMarquardt}(iterCt, sum(abs2, value(df)), g_norm, d)
+            push!(tr, os)
+            println(os)
+        end
+
+        # check convergence criteria:
+        # 1. Small gradient: norm(J^T * value(df), Inf) < g_tol
+        # 2. Small step size: norm(delta_x) < x_tol
+        if norm(J' * value(df), Inf) < g_tol
+            g_converged = true
+        end
+        if norm(delta_x) < x_tol*(x_tol + norm(x))
+            x_converged = true
+        end
+        converged = g_converged | x_converged
+    end
+
+    MultivariateOptimizationResults(
+        LevenbergMarquardt(),    # method
+        initial_x,             # initial_x
+        x,                     # minimizer
+        sum(abs2, value(df)),       # minimum
+        iterCt,                # iterations
+        !converged,            # iteration_converged
+        x_converged,           # x_converged
+        0.0,                   # x_tol
+        0.0,
+        false,                 # f_converged
+        0.0,                   # f_tol
+        0.0,
+        g_converged,           # g_converged
+        g_tol,                  # g_tol
+        0.0,
+        false,                 # f_increased
+        tr,                    # trace
+        first(df.f_calls),               # f_calls
+        first(df.df_calls),               # g_calls
+        0                      # h_calls
+    )
+end
+function projected_levenberg_marquardt(df::OnceDifferentiable,
+                                       initial_x::AbstractVector{T};
+                                       x_tol::Real = 1e-8, g_tol::Real = 1e-12,
+                                       maxIter::Integer = 1000,
+                                       lambda = T(1), gamma = T(0.9995),
+                                       show_trace::Bool = false,
+                                       project!::Union{Function,Nothing} = nothing
+                                       ) where T
+
+    # First evaluation
+    value_jacobian!!(df, initial_x)
+    project!(initial_x)
+
+    (0 < lambda) || throw(ArgumentError("0 < mu must hold."))
+    (0 < gamma < 1) || throw(ArgumentError("0 < gamma < 1 must hold."))
+
+    # other constants
+    MAX_LAMBDA = 1e16 # minimum trust region radius
+    MIN_LAMBDA = 1e-16 # maximum trust region radius
+    MIN_DIAGONAL = 1e-6 # lower bound on values of diagonal matrix used to regularize the trust region step
+
+    converged = false
+    x_converged = false
+    g_converged = false
+    iterCt = 0
+    x = copy(initial_x)
+    delta_x = copy(initial_x)
+    a = similar(x)
+
+    trial_f = similar(value(df))
+    residual = sum(abs2, value(df))
+
+    # Create buffers
+    n = length(x)
+    m = length(value(df))
+    JJ = Matrix{T}(undef, n, n)
+    n_buffer = Vector{T}(undef, n)
+    Jdelta_buffer = similar(value(df))
+
+    # and an alias for the jacobian
+    J = jacobian(df)
+
+    # Maintain a trace of the system.
+    tr = OptimizationTrace{LevenbergMarquardt}()
+    if show_trace
+        d = Dict("lambda" => lambda)
+        os = OptimizationState{LevenbergMarquardt}(iterCt, sum(abs2, value(df)), NaN, d)
+        push!(tr, os)
+        println(os)
+    end
+
+    while (~converged && iterCt < maxIter)
+        # jacobian! will check if x is new or not, so it is only actually
+        # evaluated if x was updated last iteration.
+        jacobian!(df, x) # has alias J
+
+        # we want to solve:
+        #    argmin 0.5*||J(x)*delta_x + f(x)||^2 + lambda*||delta_x||^2
+        # Solving for the minimum gives:
+        #    (J'*J + lambda*I) * delta_x == -J' * f(x)
+        # It is additionally useful to bound the elements of DtD below to help
+        # prevent "parameter evaporation".
+
+        # delta_x = ( J'*J + lambda * I ) \ ( -J'*value(df) )
+        mul!(JJ, transpose(J), J)
+        lambda_k = lambda * residual
+        JJ[diagind(JJ,0)] .+= lambda_k
+        #n_buffer is delta C, JJ is g compared to Mark's code
+        mul!(n_buffer, transpose(J), value(df))
+        rmul!(n_buffer, -1)
+
+        delta_x .= JJ \ n_buffer
+
+        # try the step and compute its quality
+        # compute it inplace according to NLSolversBase value(obj, cache, state)
+        # interface. No bang (!) because it doesn't update df besides mutating
+        # the number of f_calls
+
+        # re-use n_buffer
+        n_buffer .= x .+ delta_x
+        # Project to manifold
+        project!(n_buffer)
+        value(df, trial_f, n_buffer)
+
+        # update the sum of squares
+        trial_residual = sum(abs2, trial_f)
+
+        if gamma^2*residual >= trial_residual
+            println("Should take PG step")
+        end
+
+        x .= n_buffer
+        # There should be an update_x_value to do this safely
+        copyto!(df.x_f, x)
+        copyto!(value(df), trial_f)
+        residual = trial_residual
+
+        iterCt += 1
+
+        # show state
+        if show_trace
+            g_norm = norm(J' * value(df), Inf)
+            d = Dict("g(x)" => g_norm, "dx" => delta_x, "lambda_k" => lambda_k)
             os = OptimizationState{LevenbergMarquardt}(iterCt, sum(abs2, value(df)), g_norm, d)
             push!(tr, os)
             println(os)
